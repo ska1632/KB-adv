@@ -5,40 +5,85 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import json
 import os
+import gspread
+from google.oauth2.service_account import Credentials
 
 # --- 定数と設定 ---
-CONFIG_FILE = "monitored_stocks.json"
-PORTFOLIO_FILE = "my_portfolio.json"
 DEFAULT_STOCKS = ["7203.T", "9984.T", "6758.T", "7974.T", "6501.T", "5803.T", "7984.T", "7453.T"]
 
 # ページ設定
 st.set_page_config(page_title="Professional Stock Monitor", layout="wide")
 st.title("📈 株式クロス監視 ＆ プロ仕様複合アドバイザーダッシュボード")
 
-# --- データ読み込み・保存関数 ---
+# --- Google Sheets 接続 ---
+@st.cache_resource
+def get_gsheet():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=scopes
+    )
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(st.secrets["SPREADSHEET_ID"])
+    return spreadsheet
+
+def get_worksheet(spreadsheet, sheet_name):
+    try:
+        return spreadsheet.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=sheet_name, rows=200, cols=10)
+
+# --- Google Sheets 読み書き関数 ---
 def load_stocks():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
-    return DEFAULT_STOCKS
+    try:
+        spreadsheet = get_gsheet()
+        ws = get_worksheet(spreadsheet, "stocks")
+        values = ws.col_values(1)
+        return [v for v in values if v] if values else DEFAULT_STOCKS
+    except Exception:
+        return DEFAULT_STOCKS
 
 def save_stocks(stock_list):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(stock_list, f)
+    try:
+        spreadsheet = get_gsheet()
+        ws = get_worksheet(spreadsheet, "stocks")
+        ws.clear()
+        ws.update("A1", [[s] for s in stock_list])
+    except Exception as e:
+        st.error(f"銘柄リストの保存に失敗しました: {e}")
 
 def load_portfolio():
-    if os.path.exists(PORTFOLIO_FILE):
-        with open(PORTFOLIO_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    try:
+        spreadsheet = get_gsheet()
+        ws = get_worksheet(spreadsheet, "portfolio")
+        records = ws.get_all_records()
+        portfolio = {}
+        for row in records:
+            if row.get("symbol"):
+                portfolio[row["symbol"]] = {
+                    "price": float(row.get("price", 0)),
+                    "qty":   int(row.get("qty", 0)),
+                }
+        return portfolio
+    except Exception:
+        return {}
 
 def save_portfolio(portfolio):
-    with open(PORTFOLIO_FILE, "w") as f:
-        json.dump(portfolio, f)
+    try:
+        spreadsheet = get_gsheet()
+        ws = get_worksheet(spreadsheet, "portfolio")
+        ws.clear()
+        ws.update("A1", [["symbol", "price", "qty"]])
+        rows = [[symbol, info["price"], info["qty"]] for symbol, info in portfolio.items()]
+        if rows:
+            ws.update("A2", rows)
+    except Exception as e:
+        st.error(f"ポートフォリオの保存に失敗しました: {e}")
 
 # --- ステージ判定（3本線対応・4段階）---
 def check_stage(df):
-    # 200日線クロス判定（長期トレンド）
     long_stage = "－"
     if len(df) >= 200 and pd.notna(df["MA200"].iloc[-1]) and pd.notna(df["MA200"].iloc[-2]):
         t_75  = df["MA75"].iloc[-1]
@@ -54,12 +99,11 @@ def check_stage(df):
         else:
             long_stage = "⚫長期弱気"
 
-    # 25日・75日線クロス判定（中期トレンド）
     if len(df) < 75:
         return "データ不足", 1.5, long_stage
 
-    today_25    = df["MA25"].iloc[-1]
-    today_75    = df["MA75"].iloc[-1]
+    today_25     = df["MA25"].iloc[-1]
+    today_75     = df["MA75"].iloc[-1]
     yesterday_25 = df["MA25"].iloc[-2]
     yesterday_75 = df["MA75"].iloc[-2]
 
@@ -79,7 +123,7 @@ def check_stage(df):
         return "🟠ステージ2 (接近・予兆)", dynamic_threshold, long_stage
     return "🟢ステージ1 (安定)", dynamic_threshold, long_stage
 
-# --- 複合アドバイザーロジック（200日線対応）---
+# --- 複合アドバイザーロジック ---
 def get_advanced_advice(df, p_price, profit_pct, stage_text, long_stage):
     if len(df) < 5:
         return "データ不足"
@@ -98,12 +142,9 @@ def get_advanced_advice(df, p_price, profit_pct, stage_text, long_stage):
     is_macd_turning_down = macd_hist_today < macd_hist_yesterday and macd_hist_yesterday > macd_hist_3days_ago
     is_bb_squeezing      = bb_width_today <= bb_width_min_10days * 1.05
 
-    # 200日線との位置関係フラグ
-    is_above_200 = (pd.notna(df["MA200"].iloc[-1]) and
-                    df["Close"].iloc[-1] > df["MA200"].iloc[-1])
+    is_above_200 = (pd.notna(df["MA200"].iloc[-1]) and df["Close"].iloc[-1] > df["MA200"].iloc[-1])
     is_long_bull = "強気" in long_stage or "長期GC" in long_stage
 
-    # ---- 未保有 ----
     if p_price == 0:
         if is_bb_squeezing:
             return "💥 【嵐の前の静けさ】BB限界収縮中。上下どちらかに大きく跳ねるエネルギー蓄積。突破待ち"
@@ -115,7 +156,6 @@ def get_advanced_advice(df, p_price, profit_pct, stage_text, long_stage):
             return "🛒 【打診買い検討】株価安値圏。MACDの売りエネルギーが底を打ち、反転の初動を検知"
         return "⏳ 特になし（トレンド見極め中）"
 
-    # ---- 含み益 +10%以上 ----
     if profit_pct >= 10.0:
         if "ステージ3 (DC確定)" in stage_text:
             return "🚨 【全利確を推奨】中期デッドクロス確定。トレンドが完全に崩壊しました"
@@ -124,10 +164,9 @@ def get_advanced_advice(df, p_price, profit_pct, stage_text, long_stage):
         if "🟢" in stage_text and df["Close"].iloc[-1] >= df["BB_upper1"].iloc[-1]:
             return "🚀 【急伸中】1σの枠を超えて上昇中。強いトレンド発生のシグナル"
         if is_above_200 and is_long_bull:
-            return "🏃‍♂️ 【継続保有】200日線上・長期強気相場の只中。上昇エネルギー維持。利益を伸ばす局面"
+            return "🏃‍♂️ 【継続保有】200日線上・長期強気相場の只中。利益を伸ばす局面"
         return "🏃‍♂️ 【継続保有】中長期の上昇エネルギー維持。このまま利益を伸ばす局面"
 
-    # ---- 小幅損益 -5%〜+10% ----
     elif -5.0 <= profit_pct < 10.0:
         if "ステージ3 (DC確定)" in stage_text:
             return "🛡️ 【撤退最優先】トントン圏でデッドクロスが確定。傷が浅いうちに現金回収を"
@@ -139,59 +178,50 @@ def get_advanced_advice(df, p_price, profit_pct, stage_text, long_stage):
             return "⏳ 【エネルギー蓄積】BB収縮中。上下のブレイクを見極め"
         return "⏳ 【静観】明確なサインなし。需給の拮抗状態"
 
-    # ---- 含み損 -5%以下 ----
     else:
         if "ステージ3 (DC確定)" in stage_text:
             return "❌ 【損切り検討】デッドクロス確定。下落エネルギーがさらに強まるリスクあり"
         if not is_above_200 and not is_long_bull:
             return "🚫 【損切り優先】200日線割れ＋長期弱気相場。戻り売りに押される可能性が高い"
         if is_macd_turning_up and df["Close"].iloc[-1] <= df["Close"].tail(5).min() * 1.02:
-            return "💎 【ナンピン買い場】株価は最安値圏だが、MACDの売りエネルギーが明確に縮小（ダイバージェンスの芽）"
+            return "💎 【ナンピン買い場】株価は最安値圏だが、MACDの売りエネルギーが明確に縮小"
         return "💤 【耐える局面】無理に動かず、MACDが明確に上を向いて売りエネルギーが抜けるのを待つ"
 
-# --- 銘柄情報の取得とプロ指標の計算（データ期間：2年）---
+# --- 銘柄データ取得 ---
 @st.cache_data(ttl=3600)
 def fetch_stock_data(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
-        df = ticker.history(period="2y")   # ← 6mo → 2y に変更
+        df = ticker.history(period="2y")
         if df.empty:
             return None
 
-        # 移動平均線（25日・75日・200日）
         df["MA25"]  = df["Close"].rolling(window=25).mean()
         df["MA75"]  = df["Close"].rolling(window=75).mean()
-        df["MA200"] = df["Close"].rolling(window=200).mean()   # ← 新規追加
-
-        # 線間乖離率（25日 vs 75日：中期トレンドの強さ）
-        df["Div_Pct"] = ((df["MA25"] - df["MA75"]) / df["MA75"]) * 100
-
-        # 長期乖離率（75日 vs 200日：長期トレンドの強さ）← 新規追加
+        df["MA200"] = df["Close"].rolling(window=200).mean()
+        df["Div_Pct"]     = ((df["MA25"] - df["MA75"])  / df["MA75"])  * 100
         df["LongDiv_Pct"] = ((df["MA75"] - df["MA200"]) / df["MA200"]) * 100
 
-        # ボリンジャーバンド（25日基準、±1σ・±2σ）
         df["BB_std"]    = df["Close"].rolling(window=25).mean()
         std_25          = df["Close"].rolling(window=25).std()
-        df["BB_upper1"] = df["BB_std"] + (std_25 * 1)
-        df["BB_lower1"] = df["BB_std"] - (std_25 * 1)
-        df["BB_upper2"] = df["BB_std"] + (std_25 * 2)
-        df["BB_lower2"] = df["BB_std"] - (std_25 * 2)
+        df["BB_upper1"] = df["BB_std"] + std_25
+        df["BB_lower1"] = df["BB_std"] - std_25
+        df["BB_upper2"] = df["BB_std"] + std_25 * 2
+        df["BB_lower2"] = df["BB_std"] - std_25 * 2
 
-        # MACD
-        ema12            = df["Close"].ewm(span=12, adjust=False).mean()
-        ema26            = df["Close"].ewm(span=26, adjust=False).mean()
-        df["MACD"]       = ema12 - ema26
+        ema12             = df["Close"].ewm(span=12, adjust=False).mean()
+        ema26             = df["Close"].ewm(span=26, adjust=False).mean()
+        df["MACD"]        = ema12 - ema26
         df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-        df["MACD_Hist"]  = df["MACD"] - df["MACD_Signal"]
+        df["MACD_Hist"]   = df["MACD"] - df["MACD_Signal"]
 
         info = ticker.info
         name = info.get("shortName", ticker_symbol)
-
         return {"df": df, "name": name}
     except:
         return None
 
-# --- UI・サイドバー構成 ---
+# --- UI・サイドバー ---
 stock_list = load_stocks()
 portfolio  = load_portfolio()
 
@@ -221,14 +251,13 @@ if selected_p_stock:
     current_p = portfolio.get(selected_p_stock, {"price": 0.0, "qty": 0})
     p_price = st.sidebar.number_input("平均購入単価 (円):", value=float(current_p["price"]), step=1.0)
     p_qty   = st.sidebar.number_input("保有株数 (株):",     value=int(current_p["qty"]),   step=100)
-
     if st.sidebar.button("保有情報を保存/更新"):
         portfolio[selected_p_stock] = {"price": p_price, "qty": p_qty}
         save_portfolio(portfolio)
         st.sidebar.success(f"{selected_p_stock} の保有情報を保存しました")
         st.rerun()
 
-# --- メイン画面：データ処理 ---
+# --- メイン画面 ---
 if st.button("🔄 情報を最新に更新"):
     st.cache_data.clear()
     st.rerun()
@@ -247,7 +276,7 @@ for symbol in stock_list:
         change       = latest_close - prev_close
         change_pct   = (change / prev_close) * 100
 
-        div_pct  = df["Div_Pct"].iloc[-1]  if pd.notna(df["Div_Pct"].iloc[-1])  else 0
+        div_pct  = df["Div_Pct"].iloc[-1]     if pd.notna(df["Div_Pct"].iloc[-1])     else 0
         long_div = df["LongDiv_Pct"].iloc[-1] if pd.notna(df["LongDiv_Pct"].iloc[-1]) else None
 
         stage_text, current_threshold, long_stage = check_stage(df)
@@ -269,18 +298,18 @@ for symbol in stock_list:
         advice_text = get_advanced_advice(df, buy_price, profit_pct_val, stage_text, long_stage)
 
         summary_rows.append({
-            "コード":     symbol,
-            "銘柄名":     data["name"],
-            "現在値":     round(latest_close, 1),
-            "前日比":     f"{change:+.1f} ({change_pct:+.2f}%)",
-            "中期乖離":   f"{div_pct:+.2f}%",
-            "長期乖離":   f"{long_div:+.2f}%" if long_div is not None else "-",  # ← 新規列
-            "中期状態":   stage_text,
-            "長期状態":   long_stage,                                              # ← 新規列
-            "購入単価":   f"{buy_price:,.1f}円" if buy_price > 0 else "-",
-            "株数":       f"{qty:,}株"          if qty > 0       else "-",
-            "評価損益":   profit_val,
-            "損益率":     profit_pct_str,
+            "コード":       symbol,
+            "銘柄名":       data["name"],
+            "現在値":       round(latest_close, 1),
+            "前日比":       f"{change:+.1f} ({change_pct:+.2f}%)",
+            "中期乖離":     f"{div_pct:+.2f}%",
+            "長期乖離":     f"{long_div:+.2f}%" if long_div is not None else "-",
+            "中期状態":     stage_text,
+            "長期状態":     long_stage,
+            "購入単価":     f"{buy_price:,.1f}円" if buy_price > 0 else "-",
+            "株数":         f"{qty:,}株"          if qty > 0       else "-",
+            "評価損益":     profit_val,
+            "損益率":       profit_pct_str,
             "AIアドバイス": advice_text,
         })
 
@@ -288,79 +317,57 @@ if summary_rows:
     st.subheader("📊 監視 ＆ 保有銘柄一覧")
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-    # --- 詳細チャート表示 ---
     st.markdown("---")
     st.subheader("🛠️ プロフェッショナル・マルチテクニカル解析チャート")
     selected_symbol = st.selectbox("詳細チャートを表示する銘柄を選択:", stock_list)
 
     if selected_symbol in all_dfs:
-        plot_df = all_dfs[selected_symbol].tail(120)   # ← 60日 → 120日に拡張
+        plot_df = all_dfs[selected_symbol].tail(120)
 
         fig = make_subplots(
             rows=4, cols=1, shared_xaxes=True,
             vertical_spacing=0.03,
-            row_heights=[0.45, 0.20, 0.20, 0.15]     # ← 4段構成（長期乖離率を追加）
+            row_heights=[0.45, 0.20, 0.20, 0.15]
         )
 
-        # 【上段：株価 ＆ 移動平均線3本 ＆ ボリンジャーバンド】
         fig.add_trace(go.Candlestick(
             x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
             low=plot_df['Low'], close=plot_df['Close'], name='株価'), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['MA25'],  name='25日線',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA25'],  name='25日線',
             line=dict(color='#FFA500', width=1.5)), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['MA75'],  name='75日線',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA75'],  name='75日線',
             line=dict(color='#1F77B4', width=1.5)), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['MA200'], name='200日線',
-            line=dict(color='#E74C3C', width=2.0, dash='dot')), row=1, col=1)  # ← 新規
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='200日線',
+            line=dict(color='#E74C3C', width=2.0, dash='dot')), row=1, col=1)
 
-        # BB ±2σ
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['BB_upper2'], name='BB +2σ',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_upper2'], name='BB +2σ',
             line=dict(color='rgba(128,128,128,0.3)', width=1, dash='dash')), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['BB_lower2'], name='BB -2σ',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower2'], name='BB -2σ',
             line=dict(color='rgba(128,128,128,0.3)', width=1, dash='dash'),
             fill='tonexty', fillcolor='rgba(128,128,128,0.02)'), row=1, col=1)
-
-        # BB ±1σ
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['BB_upper1'], name='BB +1σ',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_upper1'], name='BB +1σ',
             line=dict(color='rgba(100,149,237,0.25)', width=1, dash='dot')), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['BB_lower1'], name='BB -1σ',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower1'], name='BB -1σ',
             line=dict(color='rgba(100,149,237,0.25)', width=1, dash='dot'),
             fill='tonexty', fillcolor='rgba(100,149,237,0.04)'), row=1, col=1)
 
-        # 【2段目：中期線間乖離率（25日 vs 75日）】
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['Div_Pct'], name='中期乖離率(%)',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Div_Pct'], name='中期乖離率(%)',
             line=dict(color='#9467BD', width=2),
             fill='tozeroy', fillcolor='rgba(148,103,189,0.05)'), row=2, col=1)
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=[0]*len(plot_df),
+        fig.add_trace(go.Scatter(x=plot_df.index, y=[0]*len(plot_df),
             line=dict(color='gray', width=1, dash='dash'), showlegend=False), row=2, col=1)
 
-        # 【3段目：長期線間乖離率（75日 vs 200日）】← 新規
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['LongDiv_Pct'], name='長期乖離率(%)',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['LongDiv_Pct'], name='長期乖離率(%)',
             line=dict(color='#E74C3C', width=2),
             fill='tozeroy', fillcolor='rgba(231,76,60,0.05)'), row=3, col=1)
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=[0]*len(plot_df),
+        fig.add_trace(go.Scatter(x=plot_df.index, y=[0]*len(plot_df),
             line=dict(color='gray', width=1, dash='dash'), showlegend=False), row=3, col=1)
 
-        # 【4段目：MACD】
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['MACD'], name='MACD',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MACD'], name='MACD',
             line=dict(color='#00CC96', width=1.5)), row=4, col=1)
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['MACD_Signal'], name='シグナル',
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MACD_Signal'], name='シグナル',
             line=dict(color='#EF553B', width=1.5)), row=4, col=1)
-        fig.add_trace(go.Bar(
-            x=plot_df.index, y=plot_df['MACD_Hist'], name='ヒストグラム',
+        fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['MACD_Hist'], name='ヒストグラム',
             marker_color='rgba(100,149,237,0.4)'), row=4, col=1)
 
         fig.update_layout(
