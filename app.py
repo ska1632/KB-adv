@@ -50,7 +50,7 @@ def save_stocks(stock_list):
         spreadsheet = get_gsheet()
         ws = get_worksheet(spreadsheet, "stocks")
         ws.clear()
-        ws.update("A1", [[s] for s in stock_list])
+        ws.update(range_name="A1", values=[[s] for s in stock_list])
     except Exception as e:
         st.error(f"銘柄リストの保存に失敗しました: {e}")
 
@@ -75,10 +75,10 @@ def save_portfolio(portfolio):
         spreadsheet = get_gsheet()
         ws = get_worksheet(spreadsheet, "portfolio")
         ws.clear()
-        ws.update("A1", [["symbol", "price", "qty"]])
+        ws.update(range_name="A1", values=[["symbol", "price", "qty"]])
         rows = [[symbol, info["price"], info["qty"]] for symbol, info in portfolio.items()]
         if rows:
-            ws.update("A2", rows)
+            ws.update(range_name="A2", values=rows)
     except Exception as e:
         st.error(f"ポートフォリオの保存に失敗しました: {e}")
 
