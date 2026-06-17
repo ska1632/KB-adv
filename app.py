@@ -3,8 +3,6 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import json
-import os
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -82,6 +80,29 @@ def save_portfolio(portfolio):
     except Exception as e:
         st.error(f"ポートフォリオの保存に失敗しました: {e}")
 
+# --- RSI計算 ---
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs  = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def rsi_label(val):
+    if val >= 70:
+        return f"🔴 {val:.1f}"   # 買われすぎ
+    elif val <= 30:
+        return f"🟢 {val:.1f}"   # 売られすぎ（反発期待）
+    elif val >= 60:
+        return f"🟠 {val:.1f}"   # やや過熱
+    elif val <= 40:
+        return f"🔵 {val:.1f}"   # やや安値圏
+    else:
+        return f"⚪ {val:.1f}"   # 中立
+
 # --- ステージ判定（3本線対応・4段階）---
 def check_stage(df):
     long_stage = "－"
@@ -123,7 +144,7 @@ def check_stage(df):
         return "🟠ステージ2 (接近・予兆)", dynamic_threshold, long_stage
     return "🟢ステージ1 (安定)", dynamic_threshold, long_stage
 
-# --- 複合アドバイザーロジック ---
+# --- 複合アドバイザーロジック（RSI対応）---
 def get_advanced_advice(df, p_price, profit_pct, stage_text, long_stage):
     if len(df) < 5:
         return "データ不足"
@@ -138,56 +159,76 @@ def get_advanced_advice(df, p_price, profit_pct, stage_text, long_stage):
     bb_width_today      = (df["BB_upper2"].iloc[-1] - df["BB_lower2"].iloc[-1]) / df["BB_std"].iloc[-1] * 100
     bb_width_min_10days = ((df["BB_upper2"] - df["BB_lower2"]) / df["BB_std"] * 100).tail(10).min()
 
+    rsi_today = df["RSI"].iloc[-1]
+
     is_macd_turning_up   = macd_hist_today > macd_hist_yesterday and macd_hist_yesterday < macd_hist_3days_ago
     is_macd_turning_down = macd_hist_today < macd_hist_yesterday and macd_hist_yesterday > macd_hist_3days_ago
     is_bb_squeezing      = bb_width_today <= bb_width_min_10days * 1.05
+    is_rsi_overbought    = rsi_today >= 70    # 買われすぎ
+    is_rsi_oversold      = rsi_today <= 30    # 売られすぎ（反発期待）
+    is_rsi_hot           = rsi_today >= 60    # やや過熱
+    is_rsi_cool          = rsi_today <= 40    # やや安値圏
 
     is_above_200 = (pd.notna(df["MA200"].iloc[-1]) and df["Close"].iloc[-1] > df["MA200"].iloc[-1])
     is_long_bull = "強気" in long_stage or "長期GC" in long_stage
 
+    # ---- 未保有 ----
     if p_price == 0:
+        if is_rsi_overbought:
+            return f"⛔ 【買い見送り】RSI {rsi_today:.0f}で買われすぎ圏。高値掴みのリスクあり。押し目を待つ"
         if is_bb_squeezing:
             return "💥 【嵐の前の静けさ】BB限界収縮中。上下どちらかに大きく跳ねるエネルギー蓄積。突破待ち"
-        if "ステージ3 (GC確定)" in stage_text and is_long_bull:
-            return "✨ 【強い買い時】中期GC＋長期強気相場が一致。トレンド大転換の押し目買いチャンス"
+        if "ステージ3 (GC確定)" in stage_text and is_long_bull and not is_rsi_hot:
+            return f"✨ 【強い買い時】中期GC＋長期強気＋RSI {rsi_today:.0f}（適温）。絶好の押し目買いチャンス"
         if "ステージ3 (GC確定)" in stage_text and not is_long_bull:
             return "⚠️ 【慎重な打診買い】中期GCだが長期は弱気圏。200日線を超えるまでは少量打診にとどめる"
+        if is_rsi_oversold and is_macd_turning_up:
+            return f"🛒 【打診買い好機】RSI {rsi_today:.0f}の売られすぎ圏でMACDが反転の初動。底値圏の可能性"
         if div_today < 0 and is_macd_turning_up and macd_hist_today < 0:
             return "🛒 【打診買い検討】株価安値圏。MACDの売りエネルギーが底を打ち、反転の初動を検知"
         return "⏳ 特になし（トレンド見極め中）"
 
+    # ---- 含み益 +10%以上 ----
     if profit_pct >= 10.0:
         if "ステージ3 (DC確定)" in stage_text:
             return "🚨 【全利確を推奨】中期デッドクロス確定。トレンドが完全に崩壊しました"
+        if is_rsi_overbought and is_macd_turning_down:
+            return f"💰 【利確強く推奨】RSI {rsi_today:.0f}の買われすぎ＋MACDピークアウト。上昇エネルギー枯渇"
         if is_macd_turning_down and div_today < div_yesterday:
             return "💰 【半分売り時】含み益十分。MACDの買いエネルギーがピークアウト。調整の兆候あり"
         if "🟢" in stage_text and df["Close"].iloc[-1] >= df["BB_upper1"].iloc[-1]:
             return "🚀 【急伸中】1σの枠を超えて上昇中。強いトレンド発生のシグナル"
-        if is_above_200 and is_long_bull:
-            return "🏃‍♂️ 【継続保有】200日線上・長期強気相場の只中。利益を伸ばす局面"
+        if is_above_200 and is_long_bull and not is_rsi_overbought:
+            return "🏃‍♂️ 【継続保有】200日線上・長期強気相場の只中。RSIも適温。利益を伸ばす局面"
         return "🏃‍♂️ 【継続保有】中長期の上昇エネルギー維持。このまま利益を伸ばす局面"
 
+    # ---- 小幅損益 -5%〜+10% ----
     elif -5.0 <= profit_pct < 10.0:
         if "ステージ3 (DC確定)" in stage_text:
             return "🛡️ 【撤退最優先】トントン圏でデッドクロスが確定。傷が浅いうちに現金回収を"
         if not is_above_200 and not is_long_bull:
             return "⚠️ 【200日線割れ警戒】長期弱気相場に突入の可能性。ポジション縮小を検討"
+        if is_rsi_oversold and is_macd_turning_up:
+            return f"🛒 【買い増し好機】RSI {rsi_today:.0f}の売られすぎ圏でMACDが反転。底打ち確認できれば買い増し"
         if div_today < 0 and is_macd_turning_up:
             return "🛒 【買い増し好機】安値圏でもみ合い中、MACDの売りエネルギーが枯渇。底打ち反転へ"
         if is_bb_squeezing:
             return "⏳ 【エネルギー蓄積】BB収縮中。上下のブレイクを見極め"
         return "⏳ 【静観】明確なサインなし。需給の拮抗状態"
 
+    # ---- 含み損 -5%以下 ----
     else:
         if "ステージ3 (DC確定)" in stage_text:
             return "❌ 【損切り検討】デッドクロス確定。下落エネルギーがさらに強まるリスクあり"
         if not is_above_200 and not is_long_bull:
             return "🚫 【損切り優先】200日線割れ＋長期弱気相場。戻り売りに押される可能性が高い"
+        if is_rsi_oversold and is_macd_turning_up:
+            return f"💎 【底値圏の兆候】RSI {rsi_today:.0f}の売られすぎ＋MACD反転初動。ナンピンの検討余地あり"
         if is_macd_turning_up and df["Close"].iloc[-1] <= df["Close"].tail(5).min() * 1.02:
             return "💎 【ナンピン買い場】株価は最安値圏だが、MACDの売りエネルギーが明確に縮小"
         return "💤 【耐える局面】無理に動かず、MACDが明確に上を向いて売りエネルギーが抜けるのを待つ"
 
-# --- 銘柄データ取得 ---
+# --- 銘柄データ取得（RSI追加）---
 @st.cache_data(ttl=3600)
 def fetch_stock_data(ticker_symbol):
     try:
@@ -214,6 +255,9 @@ def fetch_stock_data(ticker_symbol):
         df["MACD"]        = ema12 - ema26
         df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
         df["MACD_Hist"]   = df["MACD"] - df["MACD_Signal"]
+
+        # RSI（14日）
+        df["RSI"] = calc_rsi(df["Close"], period=14)
 
         info = ticker.info
         name = info.get("shortName", ticker_symbol)
@@ -278,6 +322,7 @@ for symbol in stock_list:
 
         div_pct  = df["Div_Pct"].iloc[-1]     if pd.notna(df["Div_Pct"].iloc[-1])     else 0
         long_div = df["LongDiv_Pct"].iloc[-1] if pd.notna(df["LongDiv_Pct"].iloc[-1]) else None
+        rsi_val  = df["RSI"].iloc[-1]         if pd.notna(df["RSI"].iloc[-1])         else 0
 
         stage_text, current_threshold, long_stage = check_stage(df)
 
@@ -302,6 +347,7 @@ for symbol in stock_list:
             "銘柄名":       data["name"],
             "現在値":       round(latest_close, 1),
             "前日比":       f"{change:+.1f} ({change_pct:+.2f}%)",
+            "RSI":          rsi_label(rsi_val),      # ← 新規列
             "中期乖離":     f"{div_pct:+.2f}%",
             "長期乖離":     f"{long_div:+.2f}%" if long_div is not None else "-",
             "中期状態":     stage_text,
@@ -325,11 +371,12 @@ if summary_rows:
         plot_df = all_dfs[selected_symbol].tail(120)
 
         fig = make_subplots(
-            rows=4, cols=1, shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.45, 0.20, 0.20, 0.15]
+            rows=5, cols=1, shared_xaxes=True,
+            vertical_spacing=0.02,
+            row_heights=[0.40, 0.15, 0.15, 0.15, 0.15]   # ← 5段構成
         )
 
+        # 【上段：株価・移動平均3本・BB】
         fig.add_trace(go.Candlestick(
             x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
             low=plot_df['Low'], close=plot_df['Close'], name='株価'), row=1, col=1)
@@ -339,7 +386,6 @@ if summary_rows:
             line=dict(color='#1F77B4', width=1.5)), row=1, col=1)
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='200日線',
             line=dict(color='#E74C3C', width=2.0, dash='dot')), row=1, col=1)
-
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_upper2'], name='BB +2σ',
             line=dict(color='rgba(128,128,128,0.3)', width=1, dash='dash')), row=1, col=1)
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower2'], name='BB -2σ',
@@ -351,18 +397,21 @@ if summary_rows:
             line=dict(color='rgba(100,149,237,0.25)', width=1, dash='dot'),
             fill='tonexty', fillcolor='rgba(100,149,237,0.04)'), row=1, col=1)
 
+        # 【2段目：中期乖離率】
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Div_Pct'], name='中期乖離率(%)',
             line=dict(color='#9467BD', width=2),
             fill='tozeroy', fillcolor='rgba(148,103,189,0.05)'), row=2, col=1)
         fig.add_trace(go.Scatter(x=plot_df.index, y=[0]*len(plot_df),
             line=dict(color='gray', width=1, dash='dash'), showlegend=False), row=2, col=1)
 
+        # 【3段目：長期乖離率】
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['LongDiv_Pct'], name='長期乖離率(%)',
             line=dict(color='#E74C3C', width=2),
             fill='tozeroy', fillcolor='rgba(231,76,60,0.05)'), row=3, col=1)
         fig.add_trace(go.Scatter(x=plot_df.index, y=[0]*len(plot_df),
             line=dict(color='gray', width=1, dash='dash'), showlegend=False), row=3, col=1)
 
+        # 【4段目：MACD】
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MACD'], name='MACD',
             line=dict(color='#00CC96', width=1.5)), row=4, col=1)
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MACD_Signal'], name='シグナル',
@@ -370,18 +419,33 @@ if summary_rows:
         fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['MACD_Hist'], name='ヒストグラム',
             marker_color='rgba(100,149,237,0.4)'), row=4, col=1)
 
+        # 【5段目：RSI】← 新規
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['RSI'], name='RSI(14)',
+            line=dict(color='#FF7F0E', width=2)), row=5, col=1)
+        # 70ライン（買われすぎ）
+        fig.add_hline(y=70, line=dict(color='red',  width=1, dash='dash'), row=5, col=1)
+        # 30ライン（売られすぎ）
+        fig.add_hline(y=30, line=dict(color='blue', width=1, dash='dash'), row=5, col=1)
+        # 50ライン（中立）
+        fig.add_hline(y=50, line=dict(color='gray', width=1, dash='dot'),  row=5, col=1)
+        # 70〜30の帯をうっすら色付け
+        fig.add_hrect(y0=70, y1=100, fillcolor='rgba(255,0,0,0.03)',  line_width=0, row=5, col=1)
+        fig.add_hrect(y0=0,  y1=30,  fillcolor='rgba(0,0,255,0.03)',  line_width=0, row=5, col=1)
+
         fig.update_layout(
-            title=f"{selected_symbol} 総合マルチ解析（25日・75日・200日）",
+            title=f"{selected_symbol} 総合マルチ解析（25日・75日・200日・RSI）",
             xaxis_rangeslider_visible=False,
             xaxis2_rangeslider_visible=False,
             xaxis3_rangeslider_visible=False,
             xaxis4_rangeslider_visible=False,
+            xaxis5_rangeslider_visible=False,
             template="plotly_white",
-            height=900
+            height=1000
         )
         fig.update_yaxes(title_text="株価/BB",    row=1, col=1)
         fig.update_yaxes(title_text="中期乖離率", row=2, col=1)
         fig.update_yaxes(title_text="長期乖離率", row=3, col=1)
         fig.update_yaxes(title_text="MACD",       row=4, col=1)
+        fig.update_yaxes(title_text="RSI",        row=5, col=1, range=[0, 100])
 
         st.plotly_chart(fig, use_container_width=True)
